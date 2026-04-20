@@ -1,0 +1,12 @@
+# Secrets — never commit
+.env
+
+# Log files
+*.log
+orb_bot.log
+
+# macOS junk
+.DS_Store
+
+# Perl temp
+*.bak
