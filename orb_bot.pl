@@ -22,10 +22,30 @@ if (-f $env_file) {
 }
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-my @WATCHLIST      = split /,/, ($ENV_VARS{ORB_WATCHLIST}     || 'FCX,DAL,DVN,SLB,NEM');
+# Default watchlist — 100 liquid large-cap names across tech/finance/energy/
+# materials/consumer/health. Override via ORB_WATCHLIST env var.
+my $DEFAULT_WATCHLIST = join(',',
+    # Tech / megacap growth (30)
+    qw(AAPL MSFT GOOGL META AMZN NVDA TSLA AVGO ORCL AMD
+       CRM ADBE QCOM TXN INTC MU AMAT KLAC LRCX MRVL
+       NFLX TMUS UBER SHOP PYPL PLTR SNOW CRWD PANW NOW),
+    # Financials (15)
+    qw(JPM BAC WFC GS MS C BLK AXP V MA SCHW COF USB MET PNC),
+    # Energy (10)
+    qw(XOM CVX COP OXY SLB HAL EOG MPC PSX VLO),
+    # Materials / Industrials (15)
+    qw(FCX NEM GOLD X CLF NUE ALB CAT DE BA GE HON LMT RTX UPS),
+    # Consumer (15)
+    qw(WMT COST TGT HD LOW NKE SBUX MCD CMG DIS DAL UAL AAL LUV CCL),
+    # Healthcare (10)
+    qw(UNH PFE MRK LLY ABBV BMY JNJ CVS TMO ISRG),
+    # Momentum misc (5)
+    qw(COIN HOOD RBLX SMCI ANET),
+);
+my @WATCHLIST      = split /,/, ($ENV_VARS{ORB_WATCHLIST}     || $DEFAULT_WATCHLIST);
 my $MAX_TRADE_USD  = $ENV_VARS{ORB_MAX_TRADE_USD}  || 1000;
 my $BUDGET_USD     = $ENV_VARS{ORB_BUDGET_USD}     || 50000;
-my $MAX_POSITIONS  = $ENV_VARS{ORB_MAX_POSITIONS}  || 2;
+my $MAX_POSITIONS  = $ENV_VARS{ORB_MAX_POSITIONS}  || 10;
 
 # ORB params
 my $ORB_MINUTES    = $ENV_VARS{ORB_MINUTES}        || 30;
@@ -72,21 +92,55 @@ sub alpaca_get {
 sub alpaca_post {
     my ($path, $body) = @_;
     my $json = encode_json($body);
-    my $out  = `/usr/bin/curl -s -X POST "$TRADE_URL$path" \
-        -H "APCA-API-KEY-ID: $ALPACA_KEY" \
-        -H "APCA-API-SECRET-KEY: $ALPACA_SECRET" \
-        -H "Content-Type: application/json" \
-        -d '$json'`;
+    my $tmp  = "/tmp/orb_body_$$.json";
+    open my $fh, '>', $tmp or die "Cannot write $tmp: $!";
+    print $fh $json; close $fh;
+    my $cmd = qq(/usr/bin/curl -s -X POST "$TRADE_URL$path" )
+            . qq(-H "APCA-API-KEY-ID: $ALPACA_KEY" )
+            . qq(-H "APCA-API-SECRET-KEY: $ALPACA_SECRET" )
+            . qq(-H "Content-Type: application/json" )
+            . qq(--data-binary \@$tmp --max-time 30);
+    my $out = `$cmd`;
+    unlink $tmp;
     return eval { decode_json($out) } // {};
 }
 
 # ─── CURRENT ET TIME ──────────────────────────────────────────────────────────
+# US DST: 2nd Sunday of March at 02:00 → 1st Sunday of November at 02:00.
+# During DST: ET = UTC-4 (EDT). Otherwise: ET = UTC-5 (EST).
+sub _us_dst_in_effect {
+    my ($y, $m, $d, $h) = @_;   # 4-digit year, 1-12 month, 1-31 day, 0-23 UTC hour
+    return 0 if $m < 3 || $m > 11;
+    return 1 if $m > 3 && $m < 11;
+    # Find 2nd Sunday of March and 1st Sunday of November
+    # Zeller-like: day-of-week for Y-M-1
+    require POSIX;
+    my @t_mar = (0,0,12, 1, 2, $y - 1900);   # Mar 1 noon UTC
+    my $wday_mar = (POSIX::strftime("%w", @t_mar));
+    my $mar_2nd_sun = 1 + (7 - $wday_mar) % 7 + 7;     # 2nd Sunday
+    my @t_nov = (0,0,12, 1, 10, $y - 1900);  # Nov 1 noon UTC
+    my $wday_nov = (POSIX::strftime("%w", @t_nov));
+    my $nov_1st_sun = 1 + (7 - $wday_nov) % 7;
+    if ($m == 3) {
+        return 0 if $d <  $mar_2nd_sun;
+        return 1 if $d >  $mar_2nd_sun;
+        return $h >= 7 ? 1 : 0;   # 07:00 UTC = 02:00 EST → DST starts
+    }
+    if ($m == 11) {
+        return 1 if $d <  $nov_1st_sun;
+        return 0 if $d >  $nov_1st_sun;
+        return $h >= 6 ? 0 : 1;   # 06:00 UTC = 02:00 EDT → DST ends
+    }
+    return 0;
+}
+
 sub et_time {
     my @utc = gmtime(time);
-    # EDT = UTC-4 (after Mar 8 2026), EST = UTC-5 (before)
-    my $offset = 4;   # update manually if running in Nov-Mar
-    my $et_hour = ($utc[2] - $offset) % 24;
-    return ($et_hour, $utc[1]);
+    my ($sec, $min, $hr, $mday, $mon, $year) = @utc;
+    my $dst    = _us_dst_in_effect($year + 1900, $mon + 1, $mday, $hr);
+    my $offset = $dst ? 4 : 5;
+    my $et_hour = ($hr - $offset + 24) % 24;
+    return ($et_hour, $min);
 }
 
 # ─── POSITION HELPERS ─────────────────────────────────────────────────────────
@@ -337,9 +391,7 @@ if ($et_hour == $EOD_HOUR && $et_min >= $EOD_MIN) {
         for my $pos (@positions) {
             my $sym = $pos->{symbol};
             my $pnl = $pos->{unrealized_pl} // 'n/a';
-            `/usr/bin/curl -s -X DELETE "$TRADE_URL/positions/$sym" \
-                -H "APCA-API-KEY-ID: $ALPACA_KEY" \
-                -H "APCA-API-SECRET-KEY: $ALPACA_SECRET"`;
+            `/usr/bin/curl -s -X DELETE "$TRADE_URL/positions/$sym" -H "APCA-API-KEY-ID: $ALPACA_KEY" -H "APCA-API-SECRET-KEY: $ALPACA_SECRET" --max-time 30`;
             log_msg("Closed $sym — unrealized P&L: \$$pnl");
         }
     } else {

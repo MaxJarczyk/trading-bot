@@ -47,7 +47,7 @@ my $UNIV_FILE = "$CACHE_DIR/qull_universe.json";
 my %CFG = %ENV;   # start with system env — includes Railway-injected vars
 if (-f $ENV_FILE) {
     open my $ef, '<', $ENV_FILE or warn "Cannot open $ENV_FILE: $!";
-    while ($ef && <$ef>) {
+    while ($ef && ($_ = <$ef>)) {
         chomp; next if /^\s*[#\s]/ or !/=/;
         /^([^=]+)=(.*)$/ and $CFG{$1} //= $2;  # file value only if not already set
     }
@@ -59,6 +59,20 @@ my $API_SECRET = $CFG{ALPACA_SECRET_KEY_3} or die "Missing ALPACA_SECRET_KEY_3 (
 my $BUDGET     = $CFG{QULL_BUDGET_USD}    || 100_000;
 my $MAX_POS    = $CFG{QULL_MAX_POS_USD}   || 10_000;
 my $RISK_F     = $CFG{QULL_RISK_PCT}      || 0.02;
+
+# ─── Explicit watchlist (100 momentum names) — when set, skips full-universe fetch
+my $DEFAULT_QULL_WATCHLIST = join(',',
+    qw(NVDA AMD AVGO MRVL MU AMAT LRCX KLAC ASML TSM ARM SMCI DELL ANET CRDO CRCL ALMU AAOI FN LITE),
+    qw(META AAPL MSFT GOOGL AMZN NFLX ORCL CRM ADBE NOW),
+    qw(PLTR SNOW DDOG NET CRWD ZS PANW FTNT OKTA MDB HUBS MNDY WDAY INTU VEEV),
+    qw(SHOP SQ PYPL COIN HOOD SOFI AFRM NU SPGI MSCI),
+    qw(UBER DASH ABNB BKNG EXPE RBLX DUOL APP TTD RDDT),
+    qw(IONQ RGTI QBTS BBAI SOUN AI IREN MARA RIOT TMDX),
+    qw(DXCM ISRG EXAS NTRA REGN VRTX BIIB MRNA AXSM CELH),
+    qw(TSLA RIVN LCID CVNA GLXY),
+    qw(BIRD HIMS NBIS AXTI ASTS RKLB HROW HPS FORM LWLG),
+);
+my @QULL_WATCHLIST = split /,/, ($CFG{QULL_WATCHLIST} || $DEFAULT_QULL_WATCHLIST);
 
 # ─── Strategy parameters ──────────────────────────────────────────────────────
 # Universe
@@ -119,11 +133,7 @@ sub log_scan  { log_msg("SCAN ", $_[0]) }
 # ─── Alpaca REST ──────────────────────────────────────────────────────────────
 sub _curl_get {
     my ($url) = @_;
-    my $out = `/usr/bin/curl -s -X GET \
-        -H "APCA-API-KEY-ID: $API_KEY" \
-        -H "APCA-API-SECRET-KEY: $API_SECRET" \
-        --max-time 30 \
-        "$url" 2>&1`;
+    my $out = `/usr/bin/curl -s -X GET -H "APCA-API-KEY-ID: $API_KEY" -H "APCA-API-SECRET-KEY: $API_SECRET" --max-time 30 "$url" 2>&1`;
     return eval { decode_json($out) };
 }
 
@@ -134,13 +144,7 @@ sub _curl_post {
     my $tmp = "/tmp/qull_order_$$.json";
     open my $fh, '>', $tmp or die "Cannot write tmp: $!";
     print $fh $json; close $fh;
-    my $out = `/usr/bin/curl -s -X POST \
-        -H "APCA-API-KEY-ID: $API_KEY" \
-        -H "APCA-API-SECRET-KEY: $API_SECRET" \
-        -H "Content-Type: application/json" \
-        --data-binary \@$tmp \
-        --max-time 30 \
-        "$url" 2>&1`;
+    my $out = `/usr/bin/curl -s -X POST -H "APCA-API-KEY-ID: $API_KEY" -H "APCA-API-SECRET-KEY: $API_SECRET" -H "Content-Type: application/json" --data-binary \@$tmp --max-time 30 "$url" 2>&1`;
     unlink $tmp;
     return eval { decode_json($out) };
 }
@@ -151,13 +155,7 @@ sub _curl_patch {
     my $tmp = "/tmp/qull_patch_$$.json";
     open my $fh, '>', $tmp or die "Cannot write tmp: $!";
     print $fh $json; close $fh;
-    my $out = `/usr/bin/curl -s -X PATCH \
-        -H "APCA-API-KEY-ID: $API_KEY" \
-        -H "APCA-API-SECRET-KEY: $API_SECRET" \
-        -H "Content-Type: application/json" \
-        --data-binary \@$tmp \
-        --max-time 30 \
-        "$url" 2>&1`;
+    my $out = `/usr/bin/curl -s -X PATCH -H "APCA-API-KEY-ID: $API_KEY" -H "APCA-API-SECRET-KEY: $API_SECRET" -H "Content-Type: application/json" --data-binary \@$tmp --max-time 30 "$url" 2>&1`;
     unlink $tmp;
     return eval { decode_json($out) };
 }
@@ -447,9 +445,18 @@ sub detect_signals {
 # ─── SPY: market health + RS benchmark ───────────────────────────────────────
 sub load_spy_data {
     log_info("Fetching SPY bars for market health + RS benchmark...");
-    my $r = data_get("/stocks/SPY/bars?timeframe=1Day&limit=270&feed=iex");
-    unless (ref $r eq 'HASH' && ref $r->{bars} eq 'ARRAY' && @{$r->{bars}} >= 50) {
-        log_warn("Could not fetch SPY bars — skipping RS and market filter");
+    my $r;
+    for my $feed (qw(iex sip)) {
+        $r = data_get("/stocks/SPY/bars?timeframe=1Day&limit=270&feed=$feed");
+        if (ref $r eq 'HASH' && ref $r->{bars} eq 'ARRAY' && @{$r->{bars}} >= 50) {
+            log_info("SPY bars fetched via feed=$feed (" . scalar(@{$r->{bars}}) . " bars)");
+            last;
+        }
+        log_warn("SPY feed=$feed returned insufficient data; trying next feed");
+        $r = undef;
+    }
+    unless ($r) {
+        log_warn("Could not fetch SPY bars from any feed — skipping RS and market filter");
         return 1;   # default healthy
     }
 
@@ -668,8 +675,16 @@ if ($bp < $MAX_POS) {
 # 4. SPY data: market health + RS benchmark
 my $bull_market = load_spy_data();
 
-# 5. Universe
-my $universe = load_universe();
+# 5. Universe — prefer explicit watchlist (QULL_WATCHLIST env), fall back to
+#    full assets API when the variable is literally set to "ALL".
+my $universe;
+if (uc($CFG{QULL_WATCHLIST} // '') eq 'ALL') {
+    $universe = load_universe();
+    log_info("Universe mode: FULL (" . scalar(@$universe) . " symbols)");
+} else {
+    $universe = \@QULL_WATCHLIST;
+    log_info("Universe mode: WATCHLIST (" . scalar(@$universe) . " symbols)");
+}
 my @scan_syms = grep { !exists $held{$_} } @$universe;
 log_info("Scanning " . scalar(@scan_syms) . " symbols (universe minus held positions)");
 
