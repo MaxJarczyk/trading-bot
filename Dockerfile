@@ -11,3 +11,5 @@ COPY orb_bot.pl .
 RUN chmod +x orb_bot.pl
 
 CMD ["perl", "orb_bot.pl"]
+
+# ── Qullamaggie bot: use Dockerfile.qull (separate Railway service) ──────────

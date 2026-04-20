@@ -1,0 +1,16 @@
+FROM perl:5.38-slim
+
+# curl + ca-certificates for HTTPS Alpaca API calls
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY qullamaggie_bot.pl .
+
+# All modules (JSON::PP, POSIX, List::Util) are Perl core — no cpan needed
+# Paths/cache fall back to /tmp on Railway (ephemeral FS)
+# Secrets: set ALPACA_API_KEY_3, ALPACA_SECRET_KEY_3, QULL_BUDGET_USD,
+#          QULL_MAX_POS_USD, QULL_RISK_PCT as Railway environment variables
+
+CMD ["perl", "qullamaggie_bot.pl"]
