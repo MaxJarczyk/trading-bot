@@ -156,7 +156,7 @@ sub get_position_for {
     return $res;
 }
 
-# ─── BATCH FETCH ALL BARS (one API call for all symbols) ─────────────────────
+# ─── BATCH FETCH ALL BARS (chunked — 25 symbols per call) ────────────────────
 # Returns: ( \%intraday_bars, \%prev_close )
 #   %intraday_bars: { SYMBOL => [ bar, bar, ... ] }
 #   %prev_close:    { SYMBOL => close_price }
@@ -167,26 +167,37 @@ sub fetch_all_data {
 
     my @t    = gmtime(time);
     my $date = sprintf("%04d-%02d-%02d", $t[5]+1900, $t[4]+1, $t[3]);
-    my $syms = join(',', @symbols);
 
-    # ── Intraday 5-min bars (all symbols, one call) ───────────────────────────
-    my $url5 = "$DATA_URL/stocks/bars?symbols=${syms}&timeframe=5Min"
-             . "&start=${date}T13:30:00Z&feed=iex&limit=100";
-    my $res5 = alpaca_get($url5);
-    if (ref $res5 eq 'HASH' && $res5->{bars}) {
-        for my $sym (keys %{$res5->{bars}}) {
-            $intraday{$sym} = $res5->{bars}{$sym};
-        }
+    # Chunk into groups of 25 to stay within URL length limits
+    my $chunk_size = 25;
+    my @chunks;
+    for (my $i = 0; $i < @symbols; $i += $chunk_size) {
+        my $end = ($#symbols < $i + $chunk_size - 1) ? $#symbols : $i + $chunk_size - 1;
+        push @chunks, [ @symbols[$i .. $end] ];
     }
 
-    # ── Daily bars for prev-close (all symbols, one call) ────────────────────
-    my $urld = "$DATA_URL/stocks/bars?symbols=${syms}&timeframe=1Day"
-             . "&end=${date}T13:00:00Z&feed=iex&limit=3";
-    my $resd = alpaca_get($urld);
-    if (ref $resd eq 'HASH' && $resd->{bars}) {
-        for my $sym (keys %{$resd->{bars}}) {
-            my @daily = @{$resd->{bars}{$sym}};
-            $prev_close{$sym} = $daily[-1]{c} if @daily;
+    for my $chunk (@chunks) {
+        my $syms = join('%2C', @$chunk);   # URL-encode commas
+
+        # ── Intraday 5-min bars ───────────────────────────────────────────────
+        my $url5 = "$DATA_URL/stocks/bars?symbols=${syms}&timeframe=5Min"
+                 . "&start=${date}T13:30:00Z&limit=1000";
+        my $res5 = alpaca_get($url5);
+        if (ref $res5 eq 'HASH' && $res5->{bars}) {
+            for my $sym (keys %{$res5->{bars}}) {
+                $intraday{$sym} = $res5->{bars}{$sym};
+            }
+        }
+
+        # ── Daily bars for prev-close ─────────────────────────────────────────
+        my $urld = "$DATA_URL/stocks/bars?symbols=${syms}&timeframe=1Day"
+                 . "&end=${date}T13:00:00Z&limit=500";
+        my $resd = alpaca_get($urld);
+        if (ref $resd eq 'HASH' && $resd->{bars}) {
+            for my $sym (keys %{$resd->{bars}}) {
+                my @daily = @{$resd->{bars}{$sym}};
+                $prev_close{$sym} = $daily[-1]{c} if @daily;
+            }
         }
     }
 
@@ -215,7 +226,7 @@ sub check_symbol {
 
     if ($n < $orb_count + 1) {
         log_msg("[$symbol] Only $n bars — skipping");
-        return;
+        return 0;
     }
 
     # ── ORB levels ─────────────────────────────────────────────────────────────
@@ -285,7 +296,7 @@ sub check_symbol {
                         take_profit   => { limit_price => sprintf("%.2f", $target)   },
                     });
                     log_msg("[$symbol][ORB] Order: " . ($order->{id} || encode_json($order)));
-                    return;   # one trade per symbol per run
+                    return 1;   # one trade per symbol per run
                 }
                 if ($short_sig) {
                     my $risk   = $orb_high - $price;
@@ -303,7 +314,7 @@ sub check_symbol {
                         take_profit   => { limit_price => sprintf("%.2f", $target)   },
                     });
                     log_msg("[$symbol][ORB] Order: " . ($order->{id} || encode_json($order)));
-                    return;
+                    return 1;
                 }
             }
         }
@@ -316,7 +327,6 @@ sub check_symbol {
         my $ext_frac   = $MR_EXT / 100;
         my $vol_exhaust = $bar->{v} < $vol_ma * $MR_DRY;
 
-        # Previous bar's VWAP (we need it to confirm "was already extended")
         my $prev_vwap  = calc_vwap(@bars[0..$n-2]);
 
         my $above_ext  = $vwap > 0 && $price > $vwap * (1 + $ext_frac);
@@ -339,13 +349,13 @@ sub check_symbol {
             my $qty = floor($MAX_TRADE_USD / $price);
             if ($qty < 1) {
                 log_msg("[$symbol][MR] Price \$$price > max trade size — skipping");
-                return;
+                return 0;
             }
 
             if ($mr_long) {
-                my $dist   = $vwap - $price;          # distance to VWAP (= target)
-                my $stop   = $price - $dist * 0.5;    # 50% further below
-                my $target = $vwap;                    # full mean-reversion
+                my $dist   = $vwap - $price;
+                my $stop   = $price - $dist * 0.5;
+                my $target = $vwap;
                 log_msg(sprintf("[$symbol][MR] LONG — qty:%d entry:%.2f stop:%.2f target:%.2f (VWAP)",
                     $qty, $price, $stop, $target));
                 my $order = alpaca_post('/orders', {
@@ -359,6 +369,7 @@ sub check_symbol {
                     take_profit   => { limit_price => sprintf("%.2f", $target) },
                 });
                 log_msg("[$symbol][MR] Order: " . ($order->{id} || encode_json($order)));
+                return 1;
 
             } elsif ($mr_short) {
                 my $dist   = $price - $vwap;
@@ -377,9 +388,11 @@ sub check_symbol {
                     take_profit   => { limit_price => sprintf("%.2f", $target) },
                 });
                 log_msg("[$symbol][MR] Order: " . ($order->{id} || encode_json($order)));
+                return 1;
             }
         }
     }
+    return 0;
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -462,13 +475,15 @@ for my $symbol (@WATCHLIST) {
         next;
     }
 
-    check_symbol($symbol, $intraday, $prev_close_map);
+    my $traded = check_symbol($symbol, $intraday, $prev_close_map);
 
-    # Recount after each potential entry
-    @open_positions = get_all_positions();
-    $open_count     = scalar @open_positions;
-    %has_position   = map { $_->{symbol} => 1 } @open_positions;
-    $slots          = $MAX_POSITIONS - $open_count;
+    # Recount only when a trade was actually placed
+    if ($traded) {
+        @open_positions = get_all_positions();
+        $open_count     = scalar @open_positions;
+        %has_position   = map { $_->{symbol} => 1 } @open_positions;
+        $slots          = $MAX_POSITIONS - $open_count;
+    }
 }
 
 log_msg("=== Done — open positions: $open_count ===");
