@@ -391,7 +391,8 @@ if ($et_hour == $EOD_HOUR && $et_min >= $EOD_MIN) {
         for my $pos (@positions) {
             my $sym = $pos->{symbol};
             my $pnl = $pos->{unrealized_pl} // 'n/a';
-            `/usr/bin/curl -s -X DELETE "$TRADE_URL/positions/$sym" -H "APCA-API-KEY-ID: $ALPACA_KEY" -H "APCA-API-SECRET-KEY: $ALPACA_SECRET" --max-time 30`;
+            my $close_resp = `/usr/bin/curl -s -X DELETE "$TRADE_URL/positions/$sym?cancel_orders=true" -H "APCA-API-KEY-ID: $ALPACA_KEY" -H "APCA-API-SECRET-KEY: $ALPACA_SECRET" --max-time 30`;
+            log_msg("[$sym] Close response: $close_resp");
             log_msg("Closed $sym — unrealized P&L: \$$pnl");
         }
     } else {
