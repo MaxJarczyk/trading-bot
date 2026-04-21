@@ -57,7 +57,7 @@ if (-f $ENV_FILE) {
 my $API_KEY    = $CFG{ALPACA_API_KEY_3}    or die "Missing ALPACA_API_KEY_3 (set in .env or Railway env vars)";
 my $API_SECRET = $CFG{ALPACA_SECRET_KEY_3} or die "Missing ALPACA_SECRET_KEY_3 (set in .env or Railway env vars)";
 my $BUDGET     = $CFG{QULL_BUDGET_USD}    || 100_000;
-my $MAX_POS    = $CFG{QULL_MAX_POS_USD}   || 10_000;
+my $MAX_POS    = $CFG{QULL_MAX_POS_USD}   || 100_000;
 my $RISK_F     = $CFG{QULL_RISK_PCT}      || 0.02;
 
 # ─── Explicit watchlist (100 momentum names) — when set, skips full-universe fetch
@@ -109,7 +109,7 @@ my $SMA150_TREND   = 10;     # SMA150 must be above its value N bars ago (Stage 
 
 # Portfolio
 my $RR_RATIO       = 3.0;    # risk : reward target
-my $MAX_CONCURRENT = 5;      # max simultaneous positions
+my $MAX_CONCURRENT = $CFG{QULL_MAX_POSITIONS} || 5;  # max simultaneous positions
 my $BARS_NEEDED    = 260;    # daily bars per symbol (covers SMA150 + 52w high + RS)
 my $BATCH_SIZE     = 50;     # symbols per API call (smaller batches for larger payload)
 
@@ -474,7 +474,7 @@ sub load_spy_data {
     my $price  = $closes[-1];
 
     if ($price < $sma50) {
-        log_warn(sprintf("SPY %.2f < SMA50 %.2f — bear market: FLAG scan disabled", $price, $sma50));
+        log_warn(sprintf("SPY %.2f < SMA50 %.2f — caution: bear market mode (EP-gap focus, FLAG quality raised)", $price, $sma50));
         return 0;
     }
     log_info(sprintf("SPY healthy: %.2f > SMA50 %.2f | RS benchmark loaded (%d dates)",
@@ -713,6 +713,35 @@ unless (@candidates) {
 my @cand_syms = map { $_->{symbol} } @candidates;
 my %bars = fetch_bars_batch(\@cand_syms);
 
+# 7b. Inject today's intraday bar from snapshot data into each symbol's bars array.
+#     fetch_bars_batch() returns only COMPLETED daily bars (timeframe=1Day), so at
+#     09:35 ET the last bar is yesterday's close.  The snapshot dailyBar contains
+#     the live intraday bar (open/high/low/last-trade price) — we push it onto the
+#     end of each array so detect_signals() sees today's gap and volume.
+{
+    my $today_str = strftime("%Y-%m-%d", localtime);
+    my $injected  = 0;
+    for my $sym (keys %bars) {
+        my $snap = $snaps{$sym} // next;
+        my $db   = $snap->{dailyBar} // {};
+        next unless ($db->{o} // 0) > 0;   # no intraday data yet
+        my $bar_date  = $db->{t} ? substr($db->{t}, 0, 10) : $today_str;
+        my $last_date = @{$bars{$sym}} ? substr($bars{$sym}[-1]{t} // '', 0, 10) : '';
+        if ($bar_date ne $last_date) {
+            push @{$bars{$sym}}, {
+                t => $db->{t} // "${today_str}T09:30:00Z",
+                o => $db->{o} + 0,
+                h => $db->{h} + 0,
+                l => $db->{l} + 0,
+                c => $db->{c} + 0,   # last trade price (acts as current close)
+                v => $db->{v} + 0,
+            };
+            $injected++;
+        }
+    }
+    log_info("Injected today's intraday bar for $injected / " . scalar(keys %bars) . " symbols");
+}
+
 # 8. Detect signals
 log_info("Running signal detection...");
 my (@ep_sigs, @flag_sigs);
@@ -727,14 +756,16 @@ for my $sym (keys %bars) {
 
 # Sort each group by score descending
 @ep_sigs   = sort { $b->{score} <=> $a->{score} } @ep_sigs;
-@flag_sigs = $bull_market
-    ? sort { $b->{score} <=> $a->{score} } @flag_sigs
-    : ();  # suppress flags in bear market
+# In bear market, only keep FLAG signals with a large pole (≥25%) and tight flag (≤8%)
+@flag_sigs = sort { $b->{score} <=> $a->{score} }
+             ($bull_market
+                 ? @flag_sigs
+                 : grep { $_->{pole_pct} >= 25 && $_->{flag_dep} <= 8 } @flag_sigs);
 
 my @ranked = (@ep_sigs, @flag_sigs);
 
-log_scan(sprintf("Signals: %d EP + %d FLAG = %d total",
-                 scalar @ep_sigs, scalar @flag_sigs, scalar @ranked));
+log_scan(sprintf("Signals: %d EP + %d FLAG = %d total (bull=%d)",
+                 scalar @ep_sigs, scalar @flag_sigs, scalar @ranked, $bull_market));
 
 # 9. Report top signals
 if (@ranked) {
