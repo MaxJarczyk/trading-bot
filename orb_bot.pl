@@ -156,31 +156,41 @@ sub get_position_for {
     return $res;
 }
 
-# ─── GET TODAY'S 5-MIN BARS ───────────────────────────────────────────────────
-sub get_bars {
-    my ($symbol) = @_;
-    my @t    = gmtime(time);
-    my $date = sprintf("%04d-%02d-%02d", $t[5]+1900, $t[4]+1, $t[3]);
-    my $url  = "$DATA_URL/stocks/$symbol/bars?timeframe=5Min"
-             . "&start=${date}T13:30:00Z&feed=iex&limit=100";
-    my $res  = alpaca_get($url);
-    return () unless ref $res eq 'HASH' && $res->{bars};
-    return @{$res->{bars}};
-}
+# ─── BATCH FETCH ALL BARS (one API call for all symbols) ─────────────────────
+# Returns: ( \%intraday_bars, \%prev_close )
+#   %intraday_bars: { SYMBOL => [ bar, bar, ... ] }
+#   %prev_close:    { SYMBOL => close_price }
+sub fetch_all_data {
+    my @symbols = @_;
+    my %intraday;
+    my %prev_close;
 
-# ─── GET PREVIOUS DAY'S CLOSE (for gap calculation) ───────────────────────────
-sub get_prev_close {
-    my ($symbol) = @_;
     my @t    = gmtime(time);
     my $date = sprintf("%04d-%02d-%02d", $t[5]+1900, $t[4]+1, $t[3]);
-    # Fetch last 3 daily bars to safely get yesterday's close
-    my $url  = "$DATA_URL/stocks/$symbol/bars?timeframe=1Day"
+    my $syms = join(',', @symbols);
+
+    # ── Intraday 5-min bars (all symbols, one call) ───────────────────────────
+    my $url5 = "$DATA_URL/stocks/bars?symbols=${syms}&timeframe=5Min"
+             . "&start=${date}T13:30:00Z&feed=iex&limit=100";
+    my $res5 = alpaca_get($url5);
+    if (ref $res5 eq 'HASH' && $res5->{bars}) {
+        for my $sym (keys %{$res5->{bars}}) {
+            $intraday{$sym} = $res5->{bars}{$sym};
+        }
+    }
+
+    # ── Daily bars for prev-close (all symbols, one call) ────────────────────
+    my $urld = "$DATA_URL/stocks/bars?symbols=${syms}&timeframe=1Day"
              . "&end=${date}T13:00:00Z&feed=iex&limit=3";
-    my $res  = alpaca_get($url);
-    return undef unless ref $res eq 'HASH' && $res->{bars} && @{$res->{bars}};
-    my @daily = @{$res->{bars}};
-    # Return the close of the most recent completed day
-    return $daily[-1]{c};
+    my $resd = alpaca_get($urld);
+    if (ref $resd eq 'HASH' && $resd->{bars}) {
+        for my $sym (keys %{$resd->{bars}}) {
+            my @daily = @{$resd->{bars}{$sym}};
+            $prev_close{$sym} = $daily[-1]{c} if @daily;
+        }
+    }
+
+    return (\%intraday, \%prev_close);
 }
 
 # ─── VWAP ─────────────────────────────────────────────────────────────────────
@@ -197,9 +207,9 @@ sub calc_vwap {
 
 # ─── EVALUATE SIGNAL FOR ONE SYMBOL ──────────────────────────────────────────
 sub check_symbol {
-    my ($symbol) = @_;
+    my ($symbol, $intraday_ref, $prev_close_ref) = @_;
 
-    my @bars = get_bars($symbol);
+    my @bars = $intraday_ref->{$symbol} ? @{$intraday_ref->{$symbol}} : ();
     my $n    = scalar @bars;
     my $orb_count = $ORB_MINUTES / 5;
 
@@ -228,7 +238,7 @@ sub check_symbol {
     my $vol_ma    = @ma_bars ? do { my $s=0; $s+=$_ for @ma_bars; $s/@ma_bars } : $bar->{v};
 
     # ── Gap calculation ────────────────────────────────────────────────────────
-    my $prev_close = get_prev_close($symbol);
+    my $prev_close = $prev_close_ref->{$symbol};
     my $day_open   = $bars[0]->{o};
     my $gap_pct    = ($prev_close && $prev_close>0)
                    ? ($day_open - $prev_close) / $prev_close * 100
@@ -435,6 +445,11 @@ if ($open_count >= $MAX_POSITIONS) {
     exit 0;
 }
 
+# ── Batch fetch all market data (2 API calls total for all 100 symbols) ───────
+log_msg("Fetching batch data for " . scalar(@WATCHLIST) . " symbols...");
+my ($intraday, $prev_close_map) = fetch_all_data(@WATCHLIST);
+log_msg("Batch fetch complete — got data for " . scalar(keys %$intraday) . " symbols");
+
 # ── Scan watchlist ─────────────────────────────────────────────────────────────
 my $slots = $MAX_POSITIONS - $open_count;
 log_msg("Available slots: $slots");
@@ -447,7 +462,7 @@ for my $symbol (@WATCHLIST) {
         next;
     }
 
-    check_symbol($symbol);
+    check_symbol($symbol, $intraday, $prev_close_map);
 
     # Recount after each potential entry
     @open_positions = get_all_positions();
