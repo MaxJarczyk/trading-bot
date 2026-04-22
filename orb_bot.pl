@@ -63,8 +63,8 @@ my $VOL_MA_LEN     = 20;
 my $EOD_HOUR       = 15;
 my $EOD_MIN        = 55;
 
-my $ALPACA_KEY     = $ENV_VARS{ALPACA_API_KEY_2}    or die "Missing ALPACA_API_KEY_2";
-my $ALPACA_SECRET  = $ENV_VARS{ALPACA_SECRET_KEY_2} or die "Missing ALPACA_SECRET_KEY_2";
+my $ALPACA_KEY     = $ENV_VARS{ALPACA_API_KEY_2}    // '';
+my $ALPACA_SECRET  = $ENV_VARS{ALPACA_SECRET_KEY_2} // '';
 my $TRADE_URL      = 'https://paper-api.alpaca.markets/v2';
 my $DATA_URL       = 'https://data.alpaca.markets/v2';
 my $LOG            = $ENV{RAILWAY_ENVIRONMENT} ? undef
@@ -85,7 +85,7 @@ sub log_msg {
 # ─── ALPACA HELPERS ───────────────────────────────────────────────────────────
 sub alpaca_get {
     my ($url) = @_;
-    my $out = `/usr/bin/curl -s "$url" -H "APCA-API-KEY-ID: $ALPACA_KEY" -H "APCA-API-SECRET-KEY: $ALPACA_SECRET"`;
+    my $out = `/usr/bin/curl -s --max-time 30 "$url" -H "APCA-API-KEY-ID: $ALPACA_KEY" -H "APCA-API-SECRET-KEY: $ALPACA_SECRET"`;
     return eval { decode_json($out) } // {};
 }
 
@@ -402,6 +402,12 @@ log_msg("=== ORB+MR Bot — watchlist: " . join(', ', @WATCHLIST) . " ===");
 log_msg(sprintf("Params: ORB %dmin/%.2fx/RR%.1f/cut%d/gap≥%.2f%%  MR ext%.1f%%/dry%.2fx/cut%d",
     $ORB_MINUTES,$ORB_VOL_MULT,$ORB_RR,$ORB_CUT,$ORB_GAP_THRESH,
     $MR_EXT,$MR_DRY,$MR_CUT));
+
+# ── Credential check ──────────────────────────────────────────────────────────
+unless ($ALPACA_KEY && $ALPACA_SECRET) {
+    log_msg("FATAL — ALPACA_API_KEY_2 or ALPACA_SECRET_KEY_2 not set. Check Railway Variables.");
+    exit 1;
+}
 
 my ($et_hour, $et_min) = et_time();
 log_msg("ET time: ${et_hour}:${et_min}");
