@@ -445,7 +445,12 @@ if ($et_hour >= $latest_cut) {
 
 # ── Budget check ──────────────────────────────────────────────────────────────
 my $account = alpaca_get("$TRADE_URL/account");
-my $equity  = $account->{equity} || 0;
+my $equity  = $account->{equity};
+if (!defined $equity || $equity == 0) {
+    # API call failed (network/timeout) — skip this run rather than halting
+    log_msg("WARN — could not fetch account equity (API unavailable). Skipping run.");
+    exit 0;
+}
 log_msg("Equity: \$$equity  Floor: \$" . ($BUDGET_USD * 0.90));
 if ($equity < $BUDGET_USD * 0.90) {
     log_msg("HALT — equity below 90% of budget. Stopping.");
